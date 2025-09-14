@@ -1,0 +1,84 @@
+version: '3.8'
+
+services:
+  chromadb:
+    image: chromadb/chroma:latest
+    container_name: skynet-chromadb
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data/chroma:/chroma/chroma
+      - ./data/logs:/chroma/logs
+    environment:
+      - CHROMA_SERVER_HOST=0.0.0.0
+      - CHROMA_SERVER_PORT=8000
+      - CHROMA_LOG_LEVEL=INFO
+      - CHROMA_TELEMETRY_DISABLED=true
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/heartbeat"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
+    networks:
+      - skynet-network
+
+  # Optional: Add this when we build the Python agents
+  # barbie:
+  #   build:
+  #     context: .
+  #     dockerfile: Dockerfile.barbie
+  #   container_name: skynet-barbie
+  #   ports:
+  #     - "8001:8000"
+  #   environment:
+  #     - AGENT_NAME=Barbie
+  #     - AGENT_ROLE=generator
+  #     - OLLAMA_MODEL=llama3.3:70b
+  #     - CHROMA_HOST=chromadb
+  #     - CHROMA_PORT=8000
+  #   env_file:
+  #     - .env
+  #   volumes:
+  #     - ./data/conversation:/app/data
+  #     - ${CERT_DIR}:/app/certs:ro
+  #   depends_on:
+  #     chromadb:
+  #       condition: service_healthy
+  #   networks:
+  #     - skynet-network
+  #   restart: unless-stopped
+
+  # ken:
+  #   build:
+  #     context: .
+  #     dockerfile: Dockerfile.ken
+  #   container_name: skynet-ken
+  #   ports:
+  #     - "8002:8000"
+  #   environment:
+  #     - AGENT_NAME=Ken
+  #     - AGENT_ROLE=discriminator
+  #     - OLLAMA_MODEL=deepseek-r1:70b
+  #     - CHROMA_HOST=chromadb
+  #     - CHROMA_PORT=8000
+  #   env_file:
+  #     - .env
+  #   volumes:
+  #     - ./data/conversation:/app/data
+  #     - ${CERT_DIR}:/app/certs:ro
+  #   depends_on:
+  #     chromadb:
+  #       condition: service_healthy
+  #   networks:
+  #     - skynet-network
+  #   restart: unless-stopped
+
+volumes:
+  chroma_data:
+    driver: local
+
+networks:
+  skynet-network:
+    driver: bridge
