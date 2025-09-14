@@ -414,8 +414,18 @@ class KenAgent:
             
             for i, query in enumerate(research_queries[:4]):
                 try:
+                    # Ensure query is a string
+                    if not isinstance(query, str):
+                        query = str(query)
+                    
                     logger.info(f"Ken researching counter-evidence: {query}")
                     results = self.search_tool.run(query)
+                    
+                    # Ensure results are converted to string if they're not
+                    if isinstance(results, list):
+                        results = " ".join(str(item) for item in results)
+                    elif not isinstance(results, str):
+                        results = str(results)
                     
                     # Categorize the results
                     if "contradicting" in query.lower() or "limitations" in query.lower():
@@ -443,7 +453,17 @@ class KenAgent:
                 formatted_results.append("\nCRITICAL ANALYSES:")
                 formatted_results.extend(critical_analyses[:2])
             
-            state.search_results = "\n".join(formatted_results)[:4000]  # Increased for richer evidence
+            # Ensure all results are strings before joining
+            string_results = []
+            for item in formatted_results:
+                if isinstance(item, str):
+                    string_results.append(item)
+                elif isinstance(item, list):
+                    string_results.append(" ".join(str(x) for x in item))
+                else:
+                    string_results.append(str(item))
+            
+            state.search_results = "\n".join(string_results)[:4000]  # Increased for richer evidence
             logger.info(f"Ken found {len(counter_evidence)} counter-evidence, {len(alternative_perspectives)} alternatives")
                 
             return state
@@ -803,7 +823,17 @@ class KenAgent:
             )
             
             llm_queries = query_llm.invoke(extraction_prompt)
-            generated_queries = [q.strip() for q in llm_queries.split('\n') if q.strip() and len(q.strip()) > 10]
+            # Ensure each query is a string, not a list or other type
+            raw_queries = llm_queries.split('\n')
+            generated_queries = []
+            for q in raw_queries:
+                if isinstance(q, str) and q.strip() and len(q.strip()) > 10:
+                    generated_queries.append(q.strip())
+                elif not isinstance(q, str):
+                    # Convert non-strings to string representation
+                    q_str = str(q)
+                    if q_str.strip() and len(q_str.strip()) > 10:
+                        generated_queries.append(q_str.strip())
             queries.extend(generated_queries[:3])
             
         except Exception as e:
