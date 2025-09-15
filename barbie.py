@@ -298,6 +298,64 @@ class BarbieAgent:
         self.worker_thread = threading.Thread(target=self._background_worker, daemon=True)
         self.worker_thread.start()
         logger.info("Background processing worker started")
+    
+    def _reset_session_state(self):
+        """Reset all session state to prevent contamination between sessions"""
+        try:
+            logger.info("Resetting session state for new genesis request")
+            
+            # Clear all conversation tracking dictionaries
+            self.active_conversations.clear()
+            self.debate_trackers.clear()
+            self.topic_monitors.clear()
+            self.conclusion_detectors.clear()
+            self.prompt_generators.clear()
+            
+            # Reset the vector store by deleting and recreating the collection
+            try:
+                import chromadb
+                chroma_host = os.getenv("CHROMA_HOST", "localhost")
+                chroma_port = os.getenv("CHROMA_PORT", "8000")
+                
+                client = chromadb.HttpClient(
+                    host=chroma_host,
+                    port=int(chroma_port)
+                )
+                
+                # Delete the existing collection if it exists
+                try:
+                    client.delete_collection("barbie_context")
+                    logger.info("Deleted existing barbie_context collection")
+                except Exception as e:
+                    logger.debug(f"Collection might not exist: {e}")
+                
+                # Recreate the vector store with a fresh collection
+                self.vectorstore = Chroma(
+                    collection_name="barbie_context",
+                    embedding_function=self.embeddings,
+                    client=client
+                )
+                logger.info("Created fresh barbie_context collection")
+                
+            except Exception as e:
+                logger.error(f"Error resetting vector store: {e}")
+                # Continue even if vector store reset fails
+            
+            # Call Ken's reset endpoint to reset his state as well
+            try:
+                with httpx.Client(timeout=10.0) as client:
+                    response = client.post(f"{self.ken_url}/v1/reset")
+                    response.raise_for_status()
+                    logger.info("Successfully reset Ken's session state")
+            except Exception as e:
+                logger.error(f"Error calling Ken's reset endpoint: {e}")
+                # Continue even if Ken's reset fails
+            
+            logger.info("Session state reset completed")
+            
+        except Exception as e:
+            logger.error(f"Error during session reset: {e}")
+            # Continue with processing even if reset has issues
         
     def _background_worker(self):
         """Background worker thread to process requests"""
@@ -325,6 +383,9 @@ class BarbieAgent:
             conversation_id = task['conversation_id']
             
             logger.info(f"Processing genesis task: {conversation_id}")
+            
+            # Reset session state to prevent contamination from previous sessions
+            self._reset_session_state()
             
             # Start new conversation log with original question
             log_file = self.conversation_manager.begin_debate(user_input)
@@ -615,11 +676,20 @@ class BarbieAgent:
             port=int(chroma_port)
         )
         
+        # Clean up any existing collection from previous sessions on startup
+        try:
+            client.delete_collection("barbie_context")
+            logger.info("Cleaned up existing barbie_context collection from previous session")
+        except Exception as e:
+            logger.debug(f"No existing collection to clean up: {e}")
+        
+        # Create fresh collection
         self.vectorstore = Chroma(
             collection_name="barbie_context",
             embedding_function=self.embeddings,
             client=client
         )
+        logger.info("Created fresh barbie_context collection on startup")
         
     def setup_tools(self):
         """Initialize tools for web search"""

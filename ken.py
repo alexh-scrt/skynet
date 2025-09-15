@@ -57,6 +57,7 @@ class EvaluationState:
     llm_temperature: float = 1.2
     llm_top_p: float = 0.95
     conversation_history: List[str] = None
+    round_number: int = 0  # Track conversation round for progressive boosting
     
     def __post_init__(self):
         if self.conversation_history is None:
@@ -102,6 +103,48 @@ class KenAgent:
         self.worker_thread = threading.Thread(target=self._background_worker, daemon=True)
         self.worker_thread.start()
         logger.info("Ken background processing worker started")
+    
+    def reset_session_state(self):
+        """Reset all session state to prevent contamination between sessions"""
+        try:
+            logger.info("Resetting Ken's session state for new conversation")
+            
+            # Reset the vector store by deleting and recreating the collection
+            try:
+                import chromadb
+                chroma_host = os.getenv("CHROMA_HOST", "localhost")
+                chroma_port = os.getenv("CHROMA_PORT", "8000")
+                
+                client = chromadb.HttpClient(
+                    host=chroma_host,
+                    port=int(chroma_port)
+                )
+                
+                # Delete the existing collection if it exists
+                try:
+                    client.delete_collection("ken_context")
+                    logger.info("Deleted existing ken_context collection")
+                except Exception as e:
+                    logger.debug(f"Collection might not exist: {e}")
+                
+                # Recreate the vector store with a fresh collection
+                self.vectorstore = Chroma(
+                    collection_name="ken_context",
+                    embedding_function=self.embeddings,
+                    client=client
+                )
+                logger.info("Created fresh ken_context collection")
+                
+            except Exception as e:
+                logger.error(f"Error resetting vector store: {e}")
+                # Continue even if vector store reset fails
+            
+            logger.info("Ken's session state reset completed")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error during Ken's session reset: {e}")
+            return False
         
     def _background_worker(self):
         """Background worker thread to process evaluation requests"""
@@ -190,7 +233,8 @@ class KenAgent:
             
             # Initialize evaluation state (thinking tags already stripped)
             state = EvaluationState(
-                barbie_response=barbie_message
+                barbie_response=barbie_message,
+                round_number=round_number
             )
             
             # Run evaluation workflow
@@ -277,11 +321,20 @@ class KenAgent:
             port=int(chroma_port)
         )
         
+        # Clean up any existing collection from previous sessions on startup
+        try:
+            client.delete_collection("ken_context")
+            logger.info("Cleaned up existing ken_context collection from previous session")
+        except Exception as e:
+            logger.debug(f"No existing collection to clean up: {e}")
+        
+        # Create fresh collection
         self.vectorstore = Chroma(
             collection_name="ken_context",
             embedding_function=self.embeddings,
             client=client
         )
+        logger.info("Created fresh ken_context collection on startup")
         
     def setup_tools(self):
         """Initialize tools for web search and fact-checking"""
@@ -561,7 +614,7 @@ class KenAgent:
     def calculate_confidence_node(self, state: EvaluationState) -> EvaluationState:
         """Calculate confidence score and approval decision"""
         try:
-            # Use LLM to assign a confidence score
+            # Use LLM to assign a confidence score with clearer guidance
             scoring_prompt = f"""
             Based on the following evaluation, assign a confidence score from 0.0 to 1.0:
 
@@ -571,11 +624,23 @@ class KenAgent:
             FACT-CHECK RESULTS:
             {state.search_results}
 
+            SCORING GUIDELINES:
+            0.90-1.00: Exceptional - All criteria met, strong evidence, no concerns
+            0.80-0.89: Very Good - Most criteria met, good evidence, minor issues only
+            0.70-0.79: Good - Key criteria met, adequate evidence, some gaps acceptable
+            0.60-0.69: Satisfactory - Basic criteria met, some evidence, notable gaps
+            0.50-0.59: Marginal - Some criteria met, weak evidence, significant gaps
+            0.40-0.49: Poor - Few criteria met, lacking evidence, major issues
+            0.00-0.39: Unacceptable - Criteria not met, no evidence, fundamental flaws
+
             Consider:
-            - How well does the response meet the evaluation criteria?
-            - Are factual claims supported by evidence?
-            - Is the response complete and accurate?
-            - Are there any significant concerns or issues?
+            - Strength of arguments and evidence (40%)
+            - Completeness and depth of response (30%)
+            - Logical coherence and consistency (20%)
+            - Addressing of key concerns (10%)
+
+            If the response is solid with good evidence and reasoning, score 0.75 or higher.
+            If exceptional with comprehensive evidence, score 0.85 or higher.
 
             Respond with only a number between 0.0 and 1.0 representing confidence.
             """
@@ -602,14 +667,38 @@ class KenAgent:
                 # Fallback scoring based on keywords
                 state.confidence_score = self.fallback_confidence_scoring(state.evaluation_response)
             
-            # Check if discussion completeness suggests we should move toward conclusion
+            # Multi-factor confidence adjustment for better accuracy
+            original_confidence = state.confidence_score
+            
+            # Factor 1: Discussion completeness boost
             completeness_factor = self.check_discussion_completeness(state)
-            if completeness_factor > 0.5:  # Discussion is reasonably complete
-                # Boost confidence slightly to encourage consensus when discussion is thorough
-                original_confidence = state.confidence_score
-                state.confidence_score = min(1.0, state.confidence_score + (completeness_factor * 0.15))
-                if state.confidence_score > original_confidence:
-                    logger.info(f"Discussion completeness factor: {completeness_factor:.2f} - boosting confidence from {original_confidence:.2f} to {state.confidence_score:.2f}")
+            if completeness_factor > 0.5:
+                completeness_boost = completeness_factor * 0.20  # Up to 0.20 boost
+                state.confidence_score = min(1.0, state.confidence_score + completeness_boost)
+                logger.info(f"Completeness boost: +{completeness_boost:.2f} (factor: {completeness_factor:.2f})")
+            
+            # Factor 2: Evidence quality boost
+            if state.search_results and len(state.search_results) > 500:
+                if "COUNTER-EVIDENCE FOUND" in state.search_results and "addressed" in state.evaluation_response.lower():
+                    # Counter-evidence was found and addressed
+                    evidence_boost = 0.05
+                    state.confidence_score = min(1.0, state.confidence_score + evidence_boost)
+                    logger.info(f"Evidence quality boost: +{evidence_boost:.2f}")
+            
+            # Factor 3: Maturity stage boost
+            if state.maturity_stage == "convergence" or state.maturity_stage == "consensus":
+                maturity_boost = 0.03 if state.maturity_stage == "convergence" else 0.05
+                state.confidence_score = min(1.0, state.confidence_score + maturity_boost)
+                logger.info(f"Maturity stage boost: +{maturity_boost:.2f} ({state.maturity_stage})")
+            
+            # Factor 4: Round-based progressive boost (avoid endless loops)
+            if state.round_number > 15:
+                round_boost = min(0.10, (state.round_number - 15) * 0.01)  # 0.01 per round after 15
+                state.confidence_score = min(1.0, state.confidence_score + round_boost)
+                logger.info(f"Round progression boost: +{round_boost:.2f} (round {state.round_number})")
+            
+            if state.confidence_score > original_confidence:
+                logger.info(f"Total confidence adjustment: {original_confidence:.2f} → {state.confidence_score:.2f}")
             
             # Determine approval
             state.should_approve = state.confidence_score >= self.approval_threshold
@@ -862,21 +951,34 @@ class KenAgent:
         return queries[:4]  # Return up to 4 queries
     
     def fallback_confidence_scoring(self, evaluation_text: str) -> float:
-        """Fallback confidence scoring based on keywords"""
-        positive_keywords = ["excellent", "good", "strong", "accurate", "comprehensive", "clear"]
-        negative_keywords = ["poor", "weak", "inaccurate", "incomplete", "unclear", "problematic"]
+        """Fallback confidence scoring based on keywords - improved ranges"""
+        strong_positive = ["excellent", "exceptional", "comprehensive", "thorough", "compelling"]
+        moderate_positive = ["good", "strong", "accurate", "clear", "solid", "well"]
+        neutral = ["adequate", "acceptable", "reasonable", "satisfactory"]
+        moderate_negative = ["weak", "incomplete", "unclear", "limited"]
+        strong_negative = ["poor", "inaccurate", "problematic", "flawed", "insufficient"]
         
         eval_lower = evaluation_text.lower()
         
-        positive_count = sum(1 for word in positive_keywords if word in eval_lower)
-        negative_count = sum(1 for word in negative_keywords if word in eval_lower)
+        # Count occurrences with weights
+        score = 0.6  # Start at a reasonable baseline
         
-        if positive_count > negative_count:
-            return 0.7 + (positive_count - negative_count) * 0.05
-        elif negative_count > positive_count:
-            return 0.3 - (negative_count - positive_count) * 0.05
-        else:
-            return 0.5
+        score += sum(0.08 for word in strong_positive if word in eval_lower)
+        score += sum(0.04 for word in moderate_positive if word in eval_lower)
+        score += sum(0.01 for word in neutral if word in eval_lower)
+        score -= sum(0.04 for word in moderate_negative if word in eval_lower)
+        score -= sum(0.08 for word in strong_negative if word in eval_lower)
+        
+        # Additional patterns that indicate quality
+        if "all criteria met" in eval_lower:
+            score += 0.15
+        if "evidence supports" in eval_lower or "well-supported" in eval_lower:
+            score += 0.10
+        if "logical" in eval_lower and "coherent" in eval_lower:
+            score += 0.05
+            
+        # Cap the score in reasonable range
+        return max(0.3, min(0.95, score))
     
     def assess_conversation_maturity(self, state: EvaluationState) -> EvaluationState:
         """Assess conversation maturity using heuristics and LLM analysis"""
@@ -995,8 +1097,9 @@ class KenAgent:
     def build_evaluation_prompt(self, state: EvaluationState) -> str:
         """Build comprehensive evaluation prompt"""
         prompt_parts = [
-            "You are Ken, engaged in a direct conversation with Barbie about complex topics.",
-            "Your role is to critically evaluate and respond to Barbie's arguments while maintaining direct dialogue.",
+            "You are Ken, having a thoughtful conversation with Barbie.",
+            "Your role is to engage with her ideas, share your own perspectives, and keep the dialogue flowing naturally.",
+            "Be yourself - curious, thoughtful, sometimes skeptical, always engaged.",
             "",
             "BARBIE'S RESPONSE:",
             state.barbie_response,
@@ -1027,14 +1130,15 @@ class KenAgent:
         
         if state.search_results and "No specific factual claims" not in state.search_results:
             prompt_parts.extend([
-                "YOUR RESEARCH FINDINGS (USE THESE TO SUPPORT YOUR ARGUMENTS):",
+                "RESEARCH CONTEXT (use this to inform your thinking, not to recite):",
                 state.search_results,
                 "",
-                "IMPORTANT: Use the counter-evidence and alternative perspectives above to:",
-                "- Present specific studies or data that contradict Barbie's claims",
-                "- Offer alternative explanations backed by research",
-                "- Share critical analyses from experts in the field",
-                "- Cite specific sources when presenting counter-arguments",
+                "IMPORTANT: The research above should INFORM your opinion, not BE your response:",
+                "- Internalize the research findings and form YOUR OWN perspective",
+                "- Share what YOU think based on what you've learned",
+                "- Express YOUR interpretation and opinion about the implications",
+                "- Use research to support YOUR viewpoint, not as the main content",
+                "- Focus on WHY you agree or disagree, not just WHAT the research says",
                 "",
             ])
         
@@ -1055,41 +1159,47 @@ class KenAgent:
             "  ✗ 'Barbie's argument about...'",
             "  ✗ 'The points raised by Barbie...'",
             "",
-            "FOCUSED EVIDENCE-BASED DIALOGUE APPROACH:",
-            "1. Lead with counter-evidence related to the main topic: 'Barbie, research about [original question] from [source] shows that...'",
-            "2. Present alternative theories that directly address the core question: 'You mentioned X about [main topic], but studies suggest Y because...'",
-            "3. Share critical analyses relevant to the original question: 'Experts studying [main topic] have found limitations...'",
-            "4. Acknowledge strengths while staying on topic: 'Your point about X is interesting for [original question], however [study] found...'",
-            "5. Ask evidence-based questions that advance the main discussion: 'How do you reconcile your claim about [main topic] with [specific finding]?'",
-            "6. Build intellectual bridges to the core question: 'Combining your insight with this research suggests [main topic] could...'",
-            "7. If conversation drifts, redirect: 'Barbie, that's intriguing, but returning to [original question]...'",
+            "CONVERSATIONAL OPINION-BASED APPROACH:",
+            "1. Start with YOUR reaction to Barbie's points: 'Barbie, what strikes me about your argument is...'",
+            "2. Share YOUR interpretation: 'I think what's really happening here is...'",
+            "3. Express YOUR viewpoint: 'From my perspective, the issue seems to be...'",
+            "4. Build on HER ideas with YOUR thoughts: 'Your point about X makes me think that...'",
+            "5. Ask questions from genuine curiosity: 'I'm curious what you think about...'",
+            "6. Share YOUR synthesis: 'Putting this together, I believe...'",
+            "7. Stay engaged with HER specific points: 'When you mentioned X, it reminded me that...'",
             "",
-            "INTELLECTUAL CONTRIBUTION GUIDELINES:",
-            "- Present findings as contributions to the discussion, not attacks",
-            "- Use phrases like 'I found research suggesting...' or 'Studies indicate...'",
-            "- Share specific data points, statistics, or expert opinions from your research",
-            "- Connect counter-evidence to broader implications for the topic",
-            "- Maintain respectful curiosity while presenting contradicting evidence",
+            "OPINION FORMATION GUIDELINES:",
+            "- Express YOUR thoughts and reactions, not just research findings",
+            "- Use phrases like 'I think...' or 'In my view...' or 'What concerns me is...'",
+            "- When citing research, explain WHY it matters to YOU",
+            "- Share how Barbie's points changed or reinforced YOUR thinking",
+            "- Be genuine about uncertainty: 'I'm not sure about X, but I wonder if...'",
             "",
-            "RESPONSE DEPTH AND DETAIL REQUIREMENTS:",
-            "- Generate COMPREHENSIVE responses that match or exceed Barbie's level of detail",
-            "- Include multiple paragraphs exploring different aspects of the topic",
-            "- Provide specific examples, case studies, and real-world applications",
-            "- Explain the reasoning behind your counter-arguments thoroughly",
-            "- Connect ideas across disciplines when relevant",
-            "- Discuss implications, consequences, and future considerations",
-            "- Aim for responses of 300-500 words minimum",
+            "NATURAL CONVERSATIONAL FLOW:",
+            "- Write as if you're having a thoughtful conversation, not giving a lecture",
+            "- Vary your sentence structure and paragraph length naturally",
+            "- Sometimes be brief and punchy, other times elaborate when needed",
+            "- Let your personality show through - be Ken, not a research paper",
+            "- React emotionally when appropriate: 'That's fascinating!' or 'I'm skeptical about...'",
+            "- Use conversational transitions: 'You know what else?' or 'Here's the thing though...'",
+            "- Keep responses focused and relevant to Barbie's actual points",
             "",
-            "STRUCTURE YOUR RESPONSE TO INCLUDE:",
-            "1. Direct acknowledgment of Barbie's strongest points",
-            "2. Presentation of counter-evidence with detailed explanation",
-            "3. Alternative theories or frameworks with supporting research",
-            "4. Specific examples or case studies that illustrate your points",
-            "5. Questions that probe deeper into unexplored aspects",
-            "6. Synthesis of ideas that bridges different perspectives",
+            "STRUCTURE YOUR RESPONSE NATURALLY:",
+            "1. React genuinely to what Barbie said",
+            "2. Share YOUR perspective, informed by but not dominated by research",
+            "3. Build on her ideas or respectfully challenge them with YOUR reasoning",
+            "4. Ask questions that show you're engaged and thinking",
+            "5. Circle back to connect your thoughts to her main points",
+            "6. End with something that invites further discussion",
             "",
-            "FINAL REMINDER: You are Ken speaking directly TO Barbie. Never narrate, never describe, just SPEAK.",
-            "Generate a DETAILED, INFORMATIVE response that enriches the intellectual discourse:",
+            "FINAL REMINDERS:",
+            "- You are Ken having a conversation with Barbie, not writing an academic paper",
+            "- Share YOUR OPINIONS and THOUGHTS, using research to support them",
+            "- Stay FOCUSED on what Barbie actually said - don't go off on tangents",
+            "- Be GENUINE and CONVERSATIONAL, not encyclopedic",
+            "- Remember: Less facts, more perspective. Less data, more dialogue.",
+            "",
+            "Now respond to Barbie naturally, as Ken would in a real conversation:",
         ])
         
         return "\n".join(prompt_parts)
@@ -1125,6 +1235,29 @@ class KenAgent:
                 
             except Exception as e:
                 logger.error(f"Error in Ken chat endpoint: {e}")
+                raise HTTPException(status_code=500, detail=str(e))
+        
+        @self.app.post("/v1/reset")
+        async def reset_endpoint():
+            """Reset endpoint to clear session state for new conversations"""
+            try:
+                success = self.reset_session_state()
+                
+                if success:
+                    return {
+                        "status": "success",
+                        "message": "Ken's session state has been reset",
+                        "timestamp": datetime.now().isoformat()
+                    }
+                else:
+                    return {
+                        "status": "partial",
+                        "message": "Ken's session reset completed with warnings",
+                        "timestamp": datetime.now().isoformat()
+                    }
+                    
+            except Exception as e:
+                logger.error(f"Error in reset endpoint: {e}")
                 raise HTTPException(status_code=500, detail=str(e))
         
         @self.app.get("/health")

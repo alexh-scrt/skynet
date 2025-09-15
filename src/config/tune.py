@@ -24,10 +24,10 @@ class DebateParameters:
     
     # Ken's approval threshold - how confident he needs to be to approve Barbie's arguments
     # 0.60-0.70: Very agreeable (too soft, may approve weak arguments)
-    # 0.75-0.85: Balanced (healthy skepticism, reasonable convergence)  
-    # 0.90-0.95: Very critical (may be too demanding, slow convergence)
-    # 0.98+: Near-impossible to satisfy (endless debates like the 82-round example)
-    KEN_APPROVAL_THRESHOLD = 0.89
+    # 0.75-0.80: Balanced (healthy skepticism, reasonable convergence)  
+    # 0.85-0.90: Critical (demanding but achievable)
+    # 0.95+: Near-impossible to satisfy (endless debates)
+    KEN_APPROVAL_THRESHOLD = 0.89  # Adjusted to realistic range
     
     # Discussion completeness boost threshold - when to help push toward conclusion
     # If discussion completeness score > this value, boost confidence slightly
@@ -35,7 +35,7 @@ class DebateParameters:
     
     # Confidence boost amount when discussion is deemed complete
     # 0.10 = gentle nudge toward consensus, 0.20 = strong push
-    DISCUSSION_COMPLETENESS_BOOST = 0.12
+    DISCUSSION_COMPLETENESS_BOOST = 0.175  # Increased for better convergence
     
     # Maximum number of rounds before aggressive conclusion pushing
     # After this many rounds, agents should be very motivated to conclude
